@@ -1,7 +1,7 @@
 'use strict';
 
 // eslint-disable-next-line node/no-unpublished-require
-const { Config } = require('../config/default');
+const { Config } = require('../config/default.js');
 const { Client, GatewayIntentBits, Partials } = require('discord.js');
 
 
@@ -14,6 +14,15 @@ const bot = new Client({
 });
 let guild;
 let aliases;
+
+function logIt(log) {
+    let ts = '';
+    if (config.includeDateInConsoleLog) {
+      const dt = (new Date()).toISOString().slice(0, 19).replace("T", " ");
+      ts = `${dt}--`;
+    }
+    console.log(`${ts}${log}`);
+}
 
 try {
   // eslint-disable-next-line node/no-missing-require
@@ -30,16 +39,16 @@ try {
 }
 
 bot.on('ready', function () {
-  console.log(`Logged in! Serving in ${bot.guilds.cache.size} servers`);
+  logIt(`Logged in! Serving in ${bot.guilds.cache.size} servers`);
   require('./plugins.js').init();
-  console.log('type ' + config.prefix + 'help in Discord for a commands list.');
+  logIt('type ' + config.prefix + 'ezentip help in Discord for a commands list.');
   guild = bot.guilds.cache.get(config.serverId);
-  console.log(`Server: ${guild.name}  member count: ${guild.memberCount}`);
-  bot.user.setActivity(config.prefix + 'tip');
+  logIt(`Server: ${guild.name}  member count: ${guild.memberCount}`);
+  bot.user.setActivity(config.prefix + 'ezentip');
 });
 
 bot.on('disconnected', function () {
-  console.log('Disconnected!');
+  logIt('Disconnected!');
   // exit node.js with an error
   process.exitCode = 1;
 });
@@ -53,17 +62,21 @@ function checkMessageForCommand(msg) {
   // https://discord.com/developers/docs/resources/channel#message-object-message-types
   if (msg.type === 19 ) return null;
 
+  if (msg.mentions.everyone) {
+   logIt('skipping message to everyone')
+    return
+  }
   // check if message is a command
   let txt = msg.content.split(' ')[0];
-  if (msg.author.id !== bot.user.id && txt === config.prefix + 'tip') {
-    console.log('treating ' + msg.content + ' from ' + msg.author + ' as command');
+  if (msg.author.id !== bot.user.id && txt === config.prefix + 'ezentip') {
+    logIt('treating ' + msg.content + ' from ' + msg.author + ' as command');
     let cmdTxt = msg.content.split(' ')[0].substring(config.prefix.length);
     if (msg.mentions.has(bot.user)) {
       try {
         cmdTxt = msg.content.split(' ')[1];
       } catch (e) {
         // no command
-        msg.channel.send('Yes, how can I help you? DM me with !tip help');
+        msg.channel.send('Yes, how can I help you? DM me with !ezentip help');
         return;
       }
     }
@@ -80,7 +93,7 @@ function checkMessageForCommand(msg) {
         const target = guild.members.cache.has(msg.author.id) || guild.members.cache.has(guild.owner);
         // permission check
         if (target && moderation.role && !target.roles.cache.has(moderation.role)) {
-          console.log('member ' + msg.author.id + ' not allowed to use the bot');
+          logIt('member ' + msg.author.id + ' not allowed to use the bot');
           return;
         }
 
@@ -94,7 +107,7 @@ function checkMessageForCommand(msg) {
           msg.channel.send(msgTxt);
         }
       } catch (error) {
-        console.log('Failed to fetch guild user: ', error);
+        logIt('Failed to fetch guild user: ', error);
       }
     }
   } else {
@@ -119,7 +132,7 @@ exports.addCommand = function (commandName, commandObject) {
   try {
     commands[commandName] = commandObject;
   } catch (err) {
-    console.log(err);
+    logIt(err);
   }
 };
 
@@ -127,7 +140,7 @@ exports.addCustomFunc = function (customFunc) {
   try {
     customFunc(bot);
   } catch (err) {
-    console.log(err);
+    logIt(err);
   }
 };
 

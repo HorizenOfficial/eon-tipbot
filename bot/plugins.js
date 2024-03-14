@@ -15,7 +15,6 @@ let plugins = getPlugins(plugin_directory);
  */
 function load_plugins() {
   const dbot = require('./bot.js');
-  let commandCount = 0;
   let otherFunc = 0;
   for (let i = 0; i < plugins.length; i++) {
     let plugin;
@@ -29,7 +28,6 @@ function load_plugins() {
         for (let j = 0; j < plugin.commands.length; j++) {
           if (plugin.commands[j] in plugin) {
             dbot.addCommand(plugin.commands[j], plugin[plugin.commands[j]]);
-            commandCount++;
           }
         }
       }

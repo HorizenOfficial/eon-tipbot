@@ -2,13 +2,11 @@
 
 // eslint-disable-next-line node/no-unpublished-require
 const { Config } = require('../../config/default');
-
-const zencashjs = require('zencashjs');
-const crypto = require('crypto');
 const mongoose = require('mongoose');
 const axios = require('axios');
+const { ethers, toBigInt } = require('ethers');
 
-const { moderation, mongodb, admins, zencfg, botcfg } = Config
+const { moderation, mongodb, admins, ezencfg, botcfg } = Config
 
 const sweepInterval = botcfg.sweepIntervalMs || 60 * 60 * 24 * 1000;
 let sweepSuspend = botcfg.sweepSuspendMs || 60 * 60 * 1000;
@@ -17,19 +15,40 @@ let lastSuspend = new Date();
 lastSuspend = new Date(lastSuspend - sweepSuspend);
 // validation for 1-100
 const regSuspend = /^[1-9]$|^[1-9][0-9]$|^(100)$/;
-const regHex = /[0-9A-Fa-f]{6}/g;
+const includetimestamp = botcfg.includeDateInConsoleLog;
 
-const INSIGHT_BASE = botcfg.testnet ? 'https://explorer-testnet.horizen.io' : 'https://explorer.horizen.io';
-const INSIGHT_API = `${INSIGHT_BASE}/api`;
+// Set up bot wallet
+const EON_RPC = botcfg.testnet ? ezencfg.testRPCURL : ezencfg.mainRPCURL;
+let connection;
+let botWallet;
+try {
+  connection = new ethers.JsonRpcProvider(EON_RPC);
+  botWallet = new ethers.Wallet(ezencfg.priv, connection);
+} catch (error) {
+  console.error(error);
+  process.exitCode = 1;
+}
 
-let axiosApi = axios.create({
-  baseURL: INSIGHT_API,
+// Set up API
+const EON_EXPLORER = botcfg.testnet ? `${ezencfg.testExplorerURL}` : `${ezencfg.mainExplorerURLExplorerURL}`;
+const EON_API = `${EON_EXPLORER}api`;
+const axiosApi = axios.create({
+  baseURL: EON_API,
   timeout: 10000,
 });
-let db;
+const BALPARAMS = { module: 'account', action: 'balance', address: '' };
+// const BLOCKNUMPARAMS = { module: 'block', action: 'eth_block_number' };
 
+const GAS_LIMIT = 21000n; // sending to another account will always be 21000 gas
+const GAS_PRICE = ezencfg.gasPrice ? toBigInt(ezencfg.gasPrice) : 20000000000n; // must be at least the base which is the default here.
+const TX_COST = (GAS_LIMIT * GAS_PRICE);
+const MAX_TIP = ezencfg.maxTip || 1;
+
+// Set up mongodb
+const dbname = ezencfg.testnet ? mongodb.urlTest : mongodb.url;
+let db;
 try {
-  mongoose.connect(mongodb.url, mongodb.options);
+  mongoose.connect(dbname, mongodb.options);
   db = mongoose.connection;
   db.on('error', console.error.bind(console, 'connection error: '));
   db.once('open', function () {
@@ -44,104 +63,118 @@ const userSchema = mongoose.Schema({
   id: String,
   priv: String,
   address: String,
-  spent: Number,
-  received: Number,
+  phrase: String,
+  deposited: String,
+  spent: String,
+  received: String,
 });
 const User = db.model('User', userSchema);
 
+// object to track transfers in and out of bot account in case there are
+// multiple requests within one block.
+const pendingTxs = {};
 
 function isAdmin(discordId) {
   if (!admins) return false;
   return admins.includes(discordId);
 }
 
-exports.commands = ['tip'];
+exports.commands = ['ezentip'];
 
-exports.tip = {
+exports.ezentip = {
   usage: '<subcommand>',
 
   description:
     'Here are the commands you can use:\n' +
-    '**!tip help** : display this message.\n' +
-    '**!tip deposit** : get an address to top up your balance.\n' +
-    '**!tip balance** : get your balance.\n' +
-    '**!tip withdraw <amount> <address>** : withdraw <amount> ZEN from your' +
+    '**!ezentip help** : display this message.\n' +
+    '**!ezentip deposit** : get an address to top up your balance.\n' +
+    '**!ezentip balance** : get your balance.\n' +
+    '**!ezentip withdraw <amount> <address>** : withdraw <amount> eZEN from your' +
     ' balance to your <address>.\n' +
-    '**!tip <@user> <amount> [message]** : tip <@user> <amount> ZEN (maximum' +
-    ' 1 ZEN) and leave an optional [message].\n' +
-    '**!tip each <amount> <n> [message]** : drop a ZEN packet in a channel, the' +
+    '**!ezentip <@user> <amount> [message]** : tip <@user> <amount> eZEN (maximum' +
+    ' 1 eZEN) and leave an optional [message].\n' +
+    '**!ezentip each <amount> <n> [message]** : drop a eZEN packet in a channel, the' +
     ' <amount> is divided *equally* between the <n> first people to open' +
-    ' the ZEN packet. Leave an optional [message] with the ZEN packet.\n' +
-    '**!tip luck <amount> <n> [message]** : drop a ZEN packet in a channel, the' +
+    ' the eZEN packet. Leave an optional [message] with the eZEN packet.\n' +
+    '**!ezentip luck <amount> <n> [message]** : drop a eZEN packet in a channel, the' +
     ' <amount> is divided *randomly* between the <n> first people to open' +
-    ' the ZEN packet. Leave an optional [message] with the ZEN packet.\n' +
-    '**!tip open** : open the latest ZEN packet dropped into the channel.\n',
+    ' the eZEN packet. Leave an optional [message] with the eZEN packet.\n' +
+    '**!ezentip open** : open the latest eZEN packet dropped into the channel.\n',
 
-  process: function (bot, msg) {
+  process: async function (bot, msg) {
     try {
-      getUser(msg.author.id, function (err, doc) {
-        if (err) return debugLog(err);
+      const { err, user } = await getUser(msg.author.id, bot, true)
 
-        const tipper = doc;
-        tipper.isAdmin = isAdmin(doc.id);
-        const words = msg.content
-          .trim()
-          .split(' ')
-          .filter(function (n) {
-            return n !== '';
-          });
-        const subcommand = words.length >= 2 ? words[1] : 'help';
+      if (err) return debugLog(err);
+      const tipper = user;
+      tipper.isAdmin = isAdmin(user.id);
+      const words = msg.content
+        .trim()
+        .split(' ')
+        .filter(function (n) {
+          return n !== '';
+        });
+      const subcommand = words.length >= 2 ? words[1] : 'help';
 
-        switch (subcommand) {
-          case 'help':
-            doHelp(msg, tipper, words);
-            break;
+      switch (subcommand) {
+        case 'help':
+          doHelp(msg, tipper, words);
+          break;
 
-          case 'balance':
-            doBalance(msg, tipper, words);
-            break;
+        case 'balance':
+          doBalance(msg, tipper, words);
+          break;
 
-          case 'deposit':
-            doDeposit(msg, tipper);
-            break;
+        case 'deposit':
+          doDepositAddr(msg, tipper);
+          break;
 
-          case 'withdraw':
-            doWithdraw(msg, tipper, words);
-            break;
+        case 'withdraw':
+          doWithdraw(msg, tipper, words);
+          break;
 
-          case 'each':
-            createTipEach(msg, tipper, words);
-            break;
+        case 'each':
+          createTipEach(msg, tipper, words);
+          break;
 
-          case 'luck':
-            createTipLuck(msg, tipper, words);
-            break;
+        case 'luck':
+          createTipLuck(msg, tipper, words);
+          break;
 
-          case 'open':
-            doOpenTip(msg, tipper, words, bot);
-            break;
+        case 'open':
+          // tipper is actually receiver in this case
+          doOpenTip(msg, tipper, words, bot);
+          break;
 
-          case 'suspend':
-            suspend(msg, tipper, words, bot);
-            break;
+        case 'suspend':
+          suspend(msg, tipper, words, bot);
+          break;
 
-          case 'payout':
-            doPayout(msg, tipper, words, bot);
-            break;
+        case 'payout':
+          doPayout(msg, tipper, words, bot);
+          break;
 
-          default:
-            doTip(msg, tipper, words, bot);
-        }
-      });
+        case 'multipay':
+          doMultiPayout(msg, tipper, words, bot);
+          break;
+
+        case 'checkbals':
+          checkBalances(msg, tipper, words, bot);
+          break;
+
+        default:
+          doTip(msg, tipper, words, bot);
+      }
+      // });
     } catch (error) {
       console.error(error);
     }
   },
 };
 
-const TX_FEE = 0.0001;
 
-let tipAllChannels = [];
+// array of active open tips
+const tipAllChannels = [];
 let currencyHelp;
 // default currencies if coingecko fails initial request
 let allowedFiatCurrencySymbols = [
@@ -179,7 +212,11 @@ let allowedFiatCurrencySymbols = [
 ];
 
 /**
- * @param message
+ * 
+ * @param {Message}  message discord message object
+ * @param {User} tipper person sending the command 
+ * @param {array} words bot arguments sent 
+ * @returns 
  */
 function doHelp(message, tipper, words) {
   if (message.channel.type !== 1) {
@@ -188,49 +225,52 @@ function doHelp(message, tipper, words) {
   if (!words || words.length < 3) {
     message.author.send(
       'Here are the commands you can use for your account and to tip a single user:\n' +
-      '**!tip help** : display this message.\n\n' +
-      '**!tip deposit** : get an address to top up your balance. ' +
-      '(note that a 0.0001 fee will be applied to your deposit)\n' +
-      '`Warning:` Mining directly into your `tip-bot-address` is ' +
-      "prohibited (You won't be able to use these ZEN)! And no support " +
-      'for retrieving these ZEN will be provided!\n\n' +
-      '**!tip balance** : get your balance. If incorrect and you recently made a deposit, ' +
-      'please wait a few minutes for the next block and check again\n\n' +
-      '**!tip balance <currency_ticker>** : get your balance in another currency. Supported currencies: !tip help currency\n\n' +
-      '**!tip withdraw <amount> <address>** : withdraw <amount> ZEN from ' +
-      'your balance to your `T` <address> (Only `T` addresses are supported!).\n\n' +
-      '**!tip <@user> <amount> [message]** : tip <@user> <amount> ZEN. ' +
-      'Maximum tip has to be less than or equal to 1 ZEN.\n\n' +
-      '**!tip <@user> random [message]** : tip <@user> random ZEN where ' +
+      '**!ezentip help** : display this message.\n\n' +
+      '**!ezentip deposit** : get an address to top up your balance. ' +
+      '(note that a gas fees will be applied to your deposit)\n' +
+      '`Warning:` Staking your `ezentip-bot-address` is ' +
+      "not possible (You won't be able to use these eZEN outside this tip bot)!\n\n" +
+      '**!ezentip balance** : get your balance. If incorrect and you recently made a deposit, ' +
+      'please wait for the next block and check again\n\n' +
+      '**!ezentip balance <currency_ticker>** : get your balance in another currency. Supported currencies: !ezentip help currency\n\n' +
+      '**!ezentip withdraw <amount> <address>** : withdraw <amount> (or use `all` as <amount> ) eZEN from ' +
+      'your balance to your `eZEN` <address> (Only eZEN addresses are supported!).\n\n' +
+      '**!ezentip <@user> <amount> [message]** : tip <@user> <amount> eZEN. ' +
+      'Maximum tip has to be less than or equal to 1 eZEN.\n\n' +
+      '**!ezentip <@user> random [message]** : tip <@user> random eZEN where ' +
       'random is greater than 0.0 and less than 0.1)\n\n' +
-      '**!tip <@user> <amount><currency_ticker> [message]** : tip ' +
-      '<@user> ZEN in currency equivalent. Example: **!tip @lukas 200czk** (_no space between amount and ticker_). ' +
-      'You can use <currency_ticker> with every send tip command. Supported currencies: !tip help currency\n\n'
+      '**!ezentip <@user> <amount><currency_ticker> [message]** : tip ' +
+      '<@user> eZEN in currency equivalent. Example: **!ezentip @lukas 200czk** (_no space between amount and ticker_). ' +
+      'You can use <currency_ticker> with every send tip command. Supported currencies: !ezentip help currency\n\n'
     );
 
     message.author.send(
       'Commands for multiple users.\n' +
-      'The following applies to _luck_ and _each_:  Only one ZEN packet per channel is ' +
-      'allowed. Maximum is 20 people. Your ZEN packet will be active for the next ' +
-      '20 minutes, after that it can be overwritten by a new ZEN packet. Maximum tip has to be ≤ 1 ZEN.\n\n' +
-      '**!tip luck <amount> <n> [message]** : drop a ZEN packet in a channel, ' +
+      'The following applies to _luck_ and _each_:  Only one eZEN packet per channel is ' +
+      'allowed. Maximum is 20 people. Your eZEN packet will be active for the next ' +
+      '20 minutes, after that it can be overwritten by a new eZEN packet. Maximum tip has to be ≤ 1 eZEN.\n\n' +
+      '**!ezentip luck <amount> <n> [message]** : drop a eZEN packet in a channel, ' +
       'the <amount> is divided *randomly* (one tip is bigger, you can win ' +
-      'the jackpot) between the <n> first people to open the ZEN packet. Leave an ' +
-      'optional [message] with the ZEN packet.\n\n' +
-      '**!tip each <amount> <n> [message]** : drop a ZEN packet in a channel, ' +
+      'the jackpot) between the <n> first people to open the eZEN packet. Leave an ' +
+      'optional [message] with the eZEN packet.\n\n' +
+      '**!ezentip each <amount> <n> [message]** : drop a eZEN packet in a channel, ' +
       'the <amount> is divided *equally* between the <n> first people to ' +
-      'open the ZEN packet. Leave an optional [message] with the ZEN packet.\n\n'
+      'open the eZEN packet. Leave an optional [message] with the eZEN packet.\n\n'
     );
   }
 
-  if (tipper.isAdmin && (words.length === 2 || words.length > 2 && words[2] === 'admin')){
+  if (tipper.isAdmin && (words.length === 2 || words.length > 2 && words[2] === 'admin')) {
     message.author.send(
       'These are the **admin commands** you can use:\n' +
-      '**!tip suspend [30] ** : suspend scheduled background tasks for indicated minutes (default one hour) while doing payouts. ' +
+      '**!ezentip suspend [30] ** : suspend scheduled background tasks for indicated minutes (default one hour) while doing payouts. ' +
       'Optional minutes must be between 1 and 100 and is saved for next time (unless tipbot is restarted). \n\n' +
-      '**!tip payout <@user> <amount><fiat_currency_ticker> [message]** : send a tip to a someone who has completed a task. ' +
+      '**!ezentip payout <@user> <amount><fiat_currency_ticker> [message]** : send a tip to a someone who has completed a task. ' +
       'Be sure your balance is sufficient for the total of all payouts to be made since ' +
-      'your balance check is skipped when using this command. Supports the same arguments as !tip @<user>.\n\n'
+      'your balance check is skipped when using this command. Supports the same arguments as !ezentip @<user>.\n\n' +
+      '**!ezentip multipay <amounttoeach> @name1 @name2 @name3 @morenames [message]** : send the tip amount to each user listed by their @name.' +
+      'The tipper\'s balance and each name is checked before sending. Any text after last @name is sent as a message to each user. \n\n' +
+      '**!ezentip checkbals [list]** returns the total net balance of all the user accounts and the balance of the bot. Include "list" ' +
+      'for individual user balances.'
     );
   }
 
@@ -245,108 +285,124 @@ function doHelp(message, tipper, words) {
 }
 
 /**
- * @param id
- * @param cb
+ * 
+ * @param {string} id discord id
+ * @param {bot} bot 
+ * @param {user} disordUser optional. user from cache or member.user 
+ * @returns the displayed username
  */
-function getUser(id, cb) {
+async function getName(id, bot, discordUser) {
+  const member = discordUser || await bot.guilds.cache.get(botcfg.serverId).members.fetch(id);
+  // const user = await bot.guild.members.fetch(id);
+  return Promise.resolve(member.globalName || member.tag || member.user.globalName || member.user.tag);
+}
+
+/**
+ * 
+ * @param {string} id 
+ * @param {Bot} bot 
+ * @param {boolean} doName get the user name or tag if true
+ * @returns {err, user}  user is from local database
+ */
+async function getUser(id, bot, doName) {
   //  default user
   const user = new User({
     id: id,
     priv: '',
     address: '',
-    spent: 0,
-    received: 0,
+    phrase: '',
+    deposited: '0',
+    spent: '0',
+    received: '0',
   });
 
-  // look for user in DB
-  User.findOne({ id: id }, function (err, doc) {
-    if (err) {
-      return cb(err, null);
-    }
+  // check for user in DB
+  const userDb = await User.findOne({ id: id }).exec();
 
-    if (doc) {
-      // Existing User
-      return cb(null, doc);
-    } else {
-      // New User
-      const seed = crypto.randomBytes(id % 65535 | 0);
-      user.priv = zencashjs.address.mkPrivKey(seed.toString('hex'));
-      const pubKey = zencashjs.address.privKeyToPubKey(user.priv, true, botcfg.testnet ? zencashjs.config.testnet.wif : zencashjs.config.mainnet.wif);
-      user.address = zencashjs.address.pubKeyToAddr(pubKey, botcfg.testnet ? zencashjs.config.testnet.pubKeyHash : zencashjs.config.mainnet.pubKeyHash);
-      user.save(function (err) {
-        if (err) {
-          return cb(err, null);
-        }
-        return cb(null, user);
-      });
+  if (userDb) {
+    // Existing User
+    if (doName) userDb.name = await getName(id, bot);
+    return Promise.resolve({ err: null, user: userDb });
+  } else {
+    // New User account
+    const acc = ethers.Wallet.createRandom();
+    user.priv = acc.privateKey;
+    user.address = acc.address;
+    user.phrase = acc.mnemonic.phrase;
+
+    const newUser = await user.save()
+    if (user != newUser) {
+      return Promise.resolve((new Error(`user with address ${user.address} was not added to the database`), null));
     }
-  });
+    if (doName) user.name = await getName(id, bot);
+    return Promise.resolve({ err: null, user });
+  }
 }
 
 /**
- * Calculate and return user's balance. DO NOT CONFUSE WITH doBalance!
- * @param tipper
- * @param cb
+ * 
+ * @param {User} user 
+ * @returns Promise for balance info object {err, balance, balanceBI}
  */
-function getBalance(tipper, cb) {
-  // balance = total deposit amount + total received - total spent
-  axios
-    .get(INSIGHT_API + '/addr/' + tipper.address)
-    .then((res) => {
-      if (res.data.balance > 2 * TX_FEE) {
-        transferToBot(tipper, res.data.balance);
-      }
-      let balance = res.data.totalReceived + tipper.received - tipper.spent;
-      balance = Math.trunc(parseFloat(balance) * 10e7) / 10e7;
-      return cb(null, balance);
-    })
-    .catch((err) => {
-      return cb(err.data ? err.data : err, null);
-    });
+async function getBalance(user) {
+  const balBI = await botWallet.provider.getBalance(user.address);
+  const result = { err: null, balance: null, balanceBI: null };
+  if (balBI >= 0n) {
+    if (balBI > (2n * TX_COST)) {
+      transferToBot(user, balBI);
+    }
+    const tipBalBI = balBI + toBigInt(user.deposited) + toBigInt(user.received) - toBigInt(user.spent);
+    const balance = Number(tipBalBI) / 1e18;
+    result.balance = balance;
+    result.balanceBI = tipBalBI;
+  } else {
+    result.err = "Balance not returned";
+  }
+  return Promise.resolve(result)
 }
 
 /**
- * Reply to !tip balance and display user's balance.
+ * Reply to !ezentip balance and display user's balance.
  * DO NOT CONFUSE WITH getBalance!
  * @param message
  * @param tipper
  */
-function doBalance(message, tipper, words) {
+async function doBalance(message, tipper, words) {
   if (message.channel.type !== 1) {
     return message.reply('send me this command in a direct message!');
   }
 
-  getBalance(tipper, function (err, balance) {
-    if (err) {
-      debugLog(err);
-      return message.reply('error getting balance!');
-    }
-    if (words.length > 2 && allowedFiatCurrencySymbols.includes(words[2].toLowerCase())) {
-      getFiatToZenEquivalent(balance, words[2], true, function (err, value) {
-        if (err) {
-          message.reply(`Error getting currency rate for ${words[2]}`);
-          return;
-        }
-        message.reply(`You have **${value} ${words[2]}**  (${balance} ZEN}`);
+  const balInfo = await getBalance(tipper);
+  if (balInfo.err) {
+    debugLog(balInfo.err);
+    return message.reply('error getting balance!');
+  }
+  if (words.length > 2 && allowedFiatCurrencySymbols.includes(words[2].toLowerCase())) {
+    getFiatToZenEquivalent(balInfo.balance, words[2], true, function (err, value) {
+      if (err) {
+        message.reply(`Error getting currency rate for ${words[2]}`);
         return;
-      });
-    } else {
-      message.reply(`You have **${balance}** ZEN`);
-    }
-  });
+      }
+      message.reply(`You have **${value} ${words[2]}**  (${balInfo.balance} eZEN)`);
+      return;
+    });
+  } else {
+    message.reply(`You have **${balInfo.balance}** eZEN`);
+  }
 }
 
 /**
- * @param message
- * @param tipper
+ * 
+ * @param {Message} message 
+ * @param {User} tipper 
+ * @returns  message to user with the deposit address
  */
-function doDeposit(message, tipper) {
+function doDepositAddr(message, tipper) {
   if (message.channel.type !== 1) {
     return message.reply('send me this command in a direct message!');
   }
-
-  message.reply('**WARNING: do not mine to this address, your ZEN will not' + ' be credited to your balance !**\n\n' + 'Your deposit address is:');
-  message.reply(tipper.address);
+  message.reply('**WARNING: do not stake/forge with this address, your eZEN is consolidated' +
+    ' in the bot !**\n\n' + 'Your deposit address is: ' + tipper.address);
 }
 
 /**
@@ -390,78 +446,89 @@ function getsSupportedCurrencies(cb) {
 /**
  * Validate syntax and check if user's balance is enough to manipulate the
  * requested amount and also stop manipulation if amount is 0.
- * @param tipper
- * @param message
- * @param _amount
- * @param cb
+ *
+ * @param {User} tipper 
+ * @param {Message} message 
+ * @param {number} _amount amount of tip
+ * @param {function} cb 
+ * @return cb returns balance as amount of eZEN 
  */
-function getValidatedAmount(tipper, message, _amount, cb) {
-  getBalance(tipper, function (err, balance) {
-    if (err) {
-      message.reply('Error getting your balance');
-      return cb(err, null);
-    }
+async function getValidatedAmount(tipper, message, _amount, cb) {
+  const bal = await getBalance(tipper);
+  // balance is in eZen (ether)
+  if (bal.err) {
+    message.reply('Error getting your balance');
+    return cb(bal.err, null);
+  }
+  if (_amount === 'all') return cb(null, bal.balance);
 
-    let amount = _amount.trim().toLowerCase();
-    debugLog('getValidatedAmount amount: ' + amount);
+  let amount = _amount.trim().toLowerCase();
+  debugLog('getValidatedAmount amount: ' + amount);
 
-    let symbol = '';
-    if (allowedFiatCurrencySymbols.indexOf(amount.slice(-3)) > -1 || amount.toLowerCase().endsWith('zen')) {
-      // Has a correct currency symbol
-      symbol = amount.slice(-3);
-    } else if (amount.endsWith('zens')) {
-      symbol = 'zen';
-    } else if (amount === 'random') {
-      // random <0.0, 0.1) ZEN
-      amount = Math.random() / 10;
-    }
+  let symbol = '';
+  if (allowedFiatCurrencySymbols.indexOf(amount.slice(-3)) > -1 || amount.toLowerCase().endsWith('zen')) {
+    // Has a correct currency symbol
+    symbol = amount.slice(-3);
+  } else if (amount.endsWith('zens')) {
+    symbol = 'zen';
+  } else if (amount === 'random') {
+    // random <0.0, 0.1) ZEN
+    amount = Math.random() / 10;
+  }
 
-    // 8 decimals maximum
-    amount = Math.trunc(parseFloat(amount) * 10e7) / 10e7;
+  // 8 decimals maximum (no rounding)
+  amount = Math.trunc(parseFloat(amount) * 1e8) / 1e8;
 
-    // Not A Number
-    if (isNaN(amount)) {
-      message.reply('Error incorrect amount');
-      return cb('NaN', null);
-    }
+  // Not A Number
+  if (isNaN(amount)) {
+    message.reply('Error incorrect amount');
+    return cb('NaN', null);
+  }
 
-    // Invalid amount
-    if (amount > 9000) {
-      message.reply('what? Over 9000!');
-      return cb('Over9K', null);
-    }
+  // Invalid amount
+  if ((!symbol || symbol === 'zen') && amount > MAX_TIP) {
+    message.reply(`what? Over maximum of ${MAX_TIP} eZEN!`);
+    return cb('Over max', null);
+  }
 
-    if (amount <= 0) {
-      message.reply('Amount should be >= 1e-8 Zen');
-      return cb('0', null);
-    }
+  if (amount <= 0) {
+    message.reply('Amount should be >= 0.0000001 eZen');
+    return cb('0', null);
+  }
 
-    // get fiat to zen value
-    if (symbol && symbol !== 'zen') {
-      getFiatToZenEquivalent(amount, symbol, false, function (err, value) {
-        if (err) {
-          message.reply('Error getting fiat rate');
-          return cb(err, null);
-        }
-        if (value > balance) {
-          message.reply('Your balance is too low');
-          return cb('balance', null);
-        }
-        return cb(null, value);
-      });
-
-      // zen value with no symbol
-    } else {
-      if (amount > balance) {
+  // get fiat to zen value
+  if (symbol && symbol !== 'zen') {
+    getFiatToZenEquivalent(amount, symbol, false, function (err, value) {
+      if (err) {
+        message.reply('Error getting fiat rate');
+        return cb(err, null);
+      }
+      if (value > bal.balance) {
         message.reply('Your balance is too low');
         return cb('balance', null);
       }
-      return cb(null, amount);
+      return cb(null, value);
+    });
+
+    // zen value with no symbol
+  } else {
+    if (amount > bal.balance) {
+      message.reply('Your balance is too low');
+      return cb('balance', null);
     }
-  });
+    return cb(null, amount);
+  }
 }
 
-function getValidatedPayoutAmount(tipper, message, _amount, cb) {
+/**
+ * 
+ * @param {User} tipper 
+ * @param {Message} message 
+ * @param {string} _amount 
+ * @param {function} cb 
+ * @returns cb with errors or 
+ */
+async function getValidatedPayoutAmount(tipper, message, _amount, cb) {
   // this version skips getting the balance for the tipper (admin) unless a currency symbol is found
 
   let amount = _amount.trim().toLowerCase();
@@ -494,29 +561,29 @@ function getValidatedPayoutAmount(tipper, message, _amount, cb) {
   }
 
   if (amount <= 0) {
-    message.reply('Amount should be >= 1e-8 Zen');
+    message.reply('Amount should be >= 0.0000001 eZen');
     return cb('0', null);
   }
 
   // get fiat to zen value
   if (symbol && symbol !== 'zen') {
-    getBalance(tipper, function (err, balance) {
+    const bal = await getBalance(tipper);
+    if (bal.err) {
+      message.reply('Error getting your balance');
+      return cb(bal.err, null);
+    }
+    getFiatToZenEquivalent(amount, symbol, false, function (err, value) {
       if (err) {
-        message.reply('Error getting your balance');
+        message.reply('Error getting fiat rate');
         return cb(err, null);
       }
-      getFiatToZenEquivalent(amount, symbol, false, function (err, value) {
-        if (err) {
-          message.reply('Error getting fiat rate');
-          return cb(err, null);
-        }
-        if (value > balance) {
-          message.reply('Your balance is too low');
-          return cb('balance', null);
-        }
-        return cb(null, value);
-      });
+      if (value > bal.balance) {
+        message.reply('Your balance is too low');
+        return cb('balance', null);
+      }
+      return cb(null, value);
     });
+
     // zen value with no symbol
   } else {
     return cb(null, amount);
@@ -524,35 +591,98 @@ function getValidatedPayoutAmount(tipper, message, _amount, cb) {
 }
 
 /**
- * Validate amount if max is lower than maxTipZenAmount = 1.
+ * Validate amount if max is lower than maximum tip amount
  * @param amount
  */
 function getValidatedMaxAmount(amount) {
-  let maxTipZenAmount = 1;
-  return amount <= maxTipZenAmount;
+  return amount <= MAX_TIP;
 }
 
-function transferToBot(user, zenbal) {
-  createTx(user.address, user.priv, zencfg.address, TX_FEE, zenbal - TX_FEE, null, (err, res) => {
-    if (err) return debugLog(err);
-    debugLog(`transfer ${zenbal} for ${user.id}  txid:${res}`);
+function hasPending(userId, blockNum) {
+  // check if the block count has incremented.
+  const txInfo = pendingTxs[userId];
+  if (!txInfo) return false;
+  if (txInfo.blockNum >= blockNum - 2) return true;
+  delete pendingTxs[userId];
+  return false;
+}
 
-    User.updateOne({ id: user.id }, { $inc: { spent: TX_FEE } }, function (err, raw) {
-      if (err) {
-        debugLog(err);
-      } else {
-        debugLog(raw);
+async function cleanupPending() {
+  const entries = Object.entries(pendingTxs);
+  if (entries.length > 0) {
+    try {
+      const blockNum = await botWallet.provider.getBlockNumber();
+      if (blockNum) {
+        for (const [key, value] of entries) {
+          if (blockNum + 1 > value.blockNum) delete pendingTxs[key];
+        }
       }
-    });
-  });
+    } catch (error) {
+      debugLog('cleanupPending error: ' + error.message);
+    }
+  }
 }
 
+
+/**
+ * Transfer deposited amount to bot's wallet.
+ * This uses a set amount of gas and gasprice so entire amount is transferred.
+ * 
+ * @param {User} user 
+ * @param {BigInt} ezenbal balance of user's assigned ezen address
+ * @returns logged message if debug
+ */
+async function transferToBot(user, ezenbal) {
+  try {
+    // if (!user.name) user.name = await getName(user.id);
+    const signer = new ethers.Wallet(user.priv, connection);
+    const value = ezenbal - TX_COST; // value in wei as a bigInt
+    const tx = {
+      from: user.address,
+      to: botWallet.address,
+      gas: GAS_LIMIT,
+      gasPrice: GAS_PRICE,
+      value,
+    }
+    const blockNum = await signer.provider.getBlockNumber();
+    if (hasPending(user.id, blockNum)) {
+      return debugLog(`transfer to bot still pending for ${user.name} in the amount of ${ezenbal}`)
+    }
+
+    debugLog(`transferToBot ezenbal= ${ezenbal.toString()}  for user ${user.name || user.id}} `)
+    const transaction = await signer.sendTransaction(tx);
+    debugLog(transaction)
+    const pending = { blockNum, transaction, dt: new Date() }
+    pendingTxs[user.id] = pending;
+
+    // updated the net amount deposited.
+    const deposited = (toBigInt(user.deposited) + transaction.value).toString();
+    const resp = await User.updateOne({ id: user.id }, { deposited })
+    if (resp.modifiedCount == 0) {
+      return debugLog(`Unable to update user record user.id ${user.id}`);
+    }
+    return debugLog(`transfer ${Number(value) / 1e18} (${Number(ezenbal) / 1e18} minus fees) for ${user.id}  txid:${transaction.hash}`);
+  } catch (error) {
+    if (error?.info?.error?.data) debugLog(`${error.info.error.data} for account ${user.address} for member ${user.name || user.id}`)
+    if (error) return debugLog(error);
+  }
+};
+
+/**
+ * Check the user's assigned ezen address for deposited funds
+ *  and move to the bot address if found
+ * 
+ * @param {User} user 
+ */
 function checkFunds(user) {
-  axios
-    .get(INSIGHT_API + '/addr/' + user.address)
+  const params = { ...BALPARAMS }
+  params.address = user.address;
+  axiosApi
+    .request({ url: '', params })
     .then((res) => {
-      if (res.data.balance > 2 * TX_FEE) {
-        transferToBot(user, res.data.balance);
+      const bal = toBigInt(res.data.result)
+      if (bal > 2n * TX_COST) {
+        transferToBot(user, bal);
       }
     })
     .catch((err) => {
@@ -564,192 +694,50 @@ function checkFunds(user) {
  * Move all funds to the bot's address.
  *  called periodically from sweepfunds
  */
-function moveFunds() {
-  User.find({}, function (err, allUsers) {
-    if (err) return debugLog(err.data ? err.data : err);
+async function moveFunds() {
+  try {
+    const allUsers = await User.find({})
     allUsers.forEach((user) => {
       checkFunds(user);
     });
-  });
+  } catch (err) {
+    if (err) return debugLog(err.data ? err.data : err);
+  }
 }
 
-/**
- * This function check all input parameters.
- *
- * @param fromAddresses - source addresses
- * @param toAddresses - destination addresses
- * @param fee - transaction fee
- */
-function checkSendParameters(fromAddresses, toAddresses, fee) {
-  let errors = [];
-
-  // NOTE: this for is here only for case when there is more than 1 source address
-  for (const fromAddress of fromAddresses) {
-    if (fromAddress.length !== 35) {
-      errors.push('Bad length of the source address!');
-    }
-
-    if (fromAddress.substring(0, 2) !== 'zn' && fromAddress.substring(0, 2) !== 'zt') {
-      errors.push("Bad source address prefix - it has to be 'zn' or 'zt'!");
-    }
+async function checkBalances(message, tipper, words, bot) {
+  if (!tipper.isAdmin) {
+    return message.reply('That is an invalid command. Check with !ezentip help');
   }
-
-  // NOTE: this for is here only for case when there is more than 1 destination address
-  for (const toAddress of toAddresses) {
-    if (toAddress.length !== 35) {
-      errors.push('Bad length of the destination address!');
-    }
-
-    if (toAddress.substring(0, 2) !== 'zn' && toAddress.substring(0, 2) !== 'zt') {
-      errors.push("Bad destination address prefix - it has to be 'zn' or 'zt'!");
-    }
+  if (message.channel.type !== 1) {
+    return message.reply('send me this command in a direct message!');
   }
-
-  if (typeof parseInt(fee, 10) !== 'number' || fee === '') {
-    errors.push('Fee is NOT a number!');
-  }
-
-  // fee can be zero, in block can be few transactions with zero fee
-  if (fee < 0) {
-    errors.push('Fee has to be greater than or equal to zero!');
-  }
-
-  return errors;
-}
-
-/**
- * This function check all input parameters.
- *
- * @param fromAddress - source address
- * @param toAddress - destination address
- * @param fee - transaction fee
- * @param amount - amount of ZEN which will be send
- */
-function checkStandardSendParameters(fromAddress, toAddress, fee, amount) {
-  let errors = checkSendParameters([fromAddress], [toAddress], fee);
-
-  if (typeof parseInt(amount, 10) !== 'number' || amount === '') {
-    errors.push('Amount is NOT a number');
-  }
-
-  if (amount <= 0) {
-    errors.push('Amount has to be greater than zero!');
-  }
-
-  return errors;
-}
-
-/**
- * @param url
- */
-async function apiGet(url) {
-  const resp = await axiosApi(url);
-  return resp.data;
-}
-
-/**
- * @param url
- * @param form
- */
-async function apiPost(url, form) {
-  const resp = await axiosApi.post(url, form);
-  return resp.data;
-}
-
-/**
- * Function for sending funds.
- *
- * @param fromAddress - source address
- * @param privateKey - private key of source address
- * @param toAddress - destination address
- * @param fee - transaction fee
- * @param amount - amount of ZEN which will be send
- * @param message - message for response to the user
- * @param cb - callback
- */
-async function createTx(fromAddress, privateKey, toAddress, fee, amount, message, cb) {
-  let paramErrors = checkStandardSendParameters(fromAddress, toAddress, fee, amount);
-  if (paramErrors.length) {
-    // TODO: Come up with better message. For now, just make a text out of it.
-    const errString = paramErrors.join('\n\n');
-    debugLog(errString);
-    return cb(errString, null);
-  }
-
+  let doList = false;
+  if (words.length > 1 && words[2] === 'list') doList = true;
   try {
-    // Convert to satoshi
-    let amountInSatoshi = Math.round(amount * 100000000);
-    let feeInSatoshi = Math.round(fee * 100000000);
-    const prevTxURL = '/addr/' + fromAddress + '/utxo';
-    const infoURL = '/status?q=getInfo';
-    const sendRawTxURL = '/tx/send';
-
-    // Building our transaction TXOBJ
-    // Calculate maximum ZEN satoshis that we have
-    let satoshisSoFar = 0;
-    let history = [];
-    let recipients = [{ address: toAddress, satoshis: amountInSatoshi }];
-
-    const txData = await apiGet(prevTxURL);
-    if (message) message.reply('Creating transaction: 25%');
-    const infoData = await apiGet(infoURL);
-    if (message) message.reply('Creating transaction: 50%');
-
-    const blockHeight = infoData.info.blocks - 300;
-    const blockHashURL = '/block-index/' + blockHeight;
-
-    const blockHash = (await apiGet(blockHashURL)).blockHash;
-    if (message) message.reply('Creating transaction: 75%');
-
-    // Iterate through each utxo and append it to history
-    for (let i = 0; i < txData.length; i++) {
-      if (txData[i].confirmations === 0) {
-        continue;
+    const allUsers = await User.find({})
+    let userTotalZen = 0;
+    let balList = 'User balances:\n';
+    for (const user of allUsers) {
+      const balInfo = await getBalance(user)
+      userTotalZen += balInfo.balance || 0
+      if (doList) {
+        const name = await getName(user.id, bot);
+        balList += `${name}: ${balInfo.balance}\n`
       }
+    };
+    const usersBalBI = toBigInt((userTotalZen * 1e18).toString());
+    const botBalWei = await botWallet.provider.getBalance(ezencfg.address);
+    // calc as bigInts to get around js float issues
+    const diffZ = Number(toBigInt(botBalWei) - usersBalBI) / 1e18;
+    const botBalZen = Number(botBalWei) / 1e18;
+    let msg = `Total user balance: ${userTotalZen}. Bot balance: ${botBalZen}. `;
+    if (diffZ < 0) msg += `Bot needs ${diffZ} ezen to cover all users.`
+    message.reply(msg);
+    if (doList) message.reply(balList)
 
-      history = history.concat({
-        txid: txData[i].txid,
-        vout: txData[i].vout,
-        scriptPubKey: txData[i].scriptPubKey,
-      });
-
-      // How many satoshis we have so far
-      satoshisSoFar = satoshisSoFar + txData[i].satoshis;
-      if (satoshisSoFar >= amountInSatoshi + feeInSatoshi) {
-        break;
-      }
-    }
-
-    // If we don't have enough address - fail and tell it to the user
-    if (satoshisSoFar < amountInSatoshi + feeInSatoshi) {
-      let errStr = 'Insufficient funds on source address!';
-      debugLog(errStr);
-      return cb(errStr, null);
-    }
-
-    // If we don't have exact amount - refund remaining to current address
-    if (satoshisSoFar !== amountInSatoshi + feeInSatoshi) {
-      let refundSatoshis = satoshisSoFar - amountInSatoshi - feeInSatoshi;
-      recipients = recipients.concat({ address: fromAddress, satoshis: refundSatoshis });
-    }
-
-    // Create transaction
-    let txObj = zencashjs.transaction.createRawTx(history, recipients, blockHeight, blockHash);
-
-    // Sign each history transcation
-    for (let i = 0; i < history.length; i++) {
-      txObj = zencashjs.transaction.signTx(txObj, i, privateKey, true);
-    }
-
-    // Convert it to hex string
-    const txHexString = zencashjs.transaction.serializeTx(txObj);
-    const txRespData = await apiPost(sendRawTxURL, { rawtx: txHexString });
-
-    if (message) message.reply('Creating transaction: 100%');
-    return cb(null, txRespData.txid);
-  } catch (e) {
-    debugLog(e.message);
-    return cb(e.message, null);
+  } catch (err) {
+    if (err) return debugLog(err.data ? err.data : err);
   }
 }
 
@@ -768,73 +756,59 @@ function doWithdraw(message, tipper, words) {
     return doHelp(message, words);
   }
 
-  getValidatedAmount(tipper, message, words[2], function (err, amount) {
+  const toAddress = words[3];
+  if (!ethers.isAddress(toAddress)) return message.reply('Invalid withdrawl address! Only EON(eZEN starting with 0x) type addresses allowed.');
+
+  getValidatedAmount(tipper, message, words[2], async function (err, amount) {
     if (err) return;
 
-    const toAddress = words[3];
-
-    let prefix = 'zn';
-    if (botcfg.testnet) {
-      prefix = 'zt';
-    }
-
-    // only T addresses are supported!
-    if (toAddress.length !== 35 || toAddress.toLowerCase().substring(0, 2) !== prefix) {
-      return message.reply('only `T` addresses are supported!');
-    }
-
-    /*axios.get(
-            INSIGHT_API + "/utils/estimatefee"
-        ).then((res) => {*/
-    const fee = TX_FEE; //temporary
-    let fromAddress = zencfg.address;
-    let privateKey = zencfg.priv;
-
-    if (!regHex.test(privateKey)) privateKey = zencashjs.address.WIFToPrivKey(privateKey);
-    createTx(fromAddress, privateKey, toAddress, fee, amount - fee, message, function (err, txId) {
-      if (err) {
-        debugLog(err);
-        return message.reply('error creating transaction object !');
+    const ezenbal = toBigInt((amount * 1e18).toString());
+    try {
+      const value = ezenbal - TX_COST; // value in wei as a bigInt
+      const tx = {
+        from: botWallet.address,
+        to: toAddress,
+        gas: GAS_LIMIT,
+        gasPrice: GAS_PRICE,
+        value,
       }
+      const blockNum = await botWallet.provider.getBlockNumber();
+      if (pendingTxs[toAddress] && hasPending(toAddress, blockNum)) {
+        return debugLog(`withdrawl from bot still pending for ${message.author.id} in the amount of ${amount}`)
+      }
+      const transaction = await botWallet.sendTransaction(tx);
+      debugLog(transaction);
+      const pending = { blockNum, transaction, dt: new Date() }
+      pendingTxs[toAddress] = pending;
 
-      User.updateOne({ id: tipper.id }, { $inc: { spent: amount } }, function (err, raw) {
-        if (err) {
-          debugLog(err);
-        } else {
-          debugLog(raw);
-          return message.reply(`you withdrew **${amount.toString()} ZEN** (-${fee} fee) to **${toAddress}** (${txLink(txId)})!`);
-        }
-      });
-    });
-    /*}).catch((err) => {
-            debugLog(err.data);
-            return message.reply("error getting estimatefee!");
-        });*/
+      // updated the net amount deposited.
+      const spent = (toBigInt((tipper.spent)) + ezenbal).toString();
+      const resp = await User.updateOne({ id: tipper.id }, { spent })
+      if (resp.modifiedCount == 0) {
+        return debugLog(`Unable to update user record tippper.id ${tipper.id} ${tipper.name}`);
+      }
+      const fee = Number(TX_COST) / 1e18;
+      debugLog(`withdrawl ${Number(value) / 1e18} (${amount} - ${fee} fee) for ${tipper.name} ${tipper.id}  txid:${transaction.hash}`);
+      return message.reply(`you withdrew **${amount.toString()} ZEN** (-${fee} fee) to **${toAddress}** (${txLink(transaction.hash)})!`);
+
+    } catch (error) {
+      if (error) return debugLog(error);
+    }
   });
 }
 
-/**
- * @param set
- * @param channel_id
- */
-function retreiveChannelTipObjIdx(set, channel_id) {
-  for (let i = 0; i < set.length; i++) {
-    if (set[i].channel_id === channel_id) {
-      return i;
-    }
-  }
-  return null;
-}
 
 /**
- * @param message
- * @param receiver
- * @param words
- * @param bot
+ * 
+ * @param {Message} message 
+ * @param {User} receiver 
+ * @param {array} words 
+ * @param {bot} bot 
+ * @returns 
  */
-function doOpenTip(message, receiver, words, bot) {
+async function doOpenTip(message, receiver, words, bot) {
   if (message.channel.type === 1) {
-    return message.reply("you can't send me this command in a DM");
+    return message.reply("You can't send me this command in a DM");
   }
 
   // wrong command syntax
@@ -842,79 +816,96 @@ function doOpenTip(message, receiver, words, bot) {
     return doHelp(message, words);
   }
 
-  let idx = retreiveChannelTipObjIdx(tipAllChannels, message.channel.id);
+  const idx = tipAllChannels.findIndex(t => t.channel_id === message.channel.id);
   if (idx === null) {
     return message.reply('sorry, no ZEN packet to `open` in this channel!');
   }
-  debugLog('open idx' + idx);
+  debugLog('open tip idx ' + idx);
+  const tipObj = tipAllChannels[idx];
+  const tipper = tipObj.tipper;
+  debugLog('open tipper.id ' + tipper.id);
 
-  let tipper = tipAllChannels[idx].tipper;
-  debugLog('open tipper.id' + tipper.id);
+  const bal = await getBalance(tipper);
+  if (bal.err) {
+    debugLog(bal.err);
+    return message.reply('error getting balance!');
+  }
+  const balance = bal.balance;
 
-  getBalance(tipper, function (err, balance) {
-    if (err) {
-      return message.reply('error getting balance!');
-    }
+  let amount;
+  if (tipObj.luck) {
+    debugLog('open tipObj.n_used ' + tipObj.n_used);
+    debugLog('open tipObj.luck_tips ' + tipObj.luck_tips);
+    amount = parseFloat(tipObj.luck_tips[tipObj.n_used]).toFixed(8);
+  } else {
+    debugLog('open tipObj.amount_total: ' + tipObj.amount_total);
+    debugLog('open tipObj.quotient ' + tipObj.quotient);
+    amount = parseFloat(tipObj.quotient).toFixed(8);
+  }
+  debugLog('open amount: ' + amount);
+  debugLog('open balance: ' + balance);
 
-    let amount;
-    if (tipAllChannels[idx].luck) {
-      debugLog('open tipAllChannels[idx].n_used ' + tipAllChannels[idx].n_used);
-      debugLog('open tipAllChannels[idx].luck_tips ' + tipAllChannels[idx].luck_tips);
-      amount = parseFloat(tipAllChannels[idx].luck_tips[tipAllChannels[idx].n_used]).toFixed(8);
-    } else {
-      debugLog('open tipAllChannels[idx].amount_total: ' + tipAllChannels[idx].amount_total);
-      debugLog('open tipAllChannels[idx].quotient ' + tipAllChannels[idx].quotient);
-      amount = parseFloat(tipAllChannels[idx].quotient).toFixed(8);
-    }
-    debugLog('open amount: ' + amount);
-    debugLog('open balance: ' + balance);
+  if (amount <= 0) {
+    return message.reply("I don't know how to tip that many eZEN!");
+  }
+  if (amount > balance) {
+    return message.reply("Not enough eZEN in the tipper's account!");
+  }
 
-    if (amount <= 0 || amount > balance) {
-      return message.reply("I don't know how to tip that many ZEN!");
-    }
+  // prevent user from opening your own tip
+  if (tipper.id === message.author.id) {
+    return message.reply("You can't `open` your own tip ...");
+  }
 
-    // prevent user from opening your own tip
-    if (tipper.id === message.author.id) {
-      return message.reply("you can't `open` your own tip ...");
-    }
+  debugLog('open receiver.id ' + receiver.id);
 
-    debugLog('open receiver.id ' + receiver.id);
+  const claimed = tipObj.used_user.find(user => user.id = message.author.id);
+  if (claimed) return message.reply("You can't `open` this for the second time...");
+  // need callback
+  const sendError = await sendZen(tipper, receiver, amount)
+  if (sendError) {
+    debugLog(sendError);
+    return message.reply(sendError)
+  }
+  bot.users.cache.get(tipper.id).send(`${receiver.name}<@${message.author.id}> received your tip (${amount.toString()} eZEN)!`);
+  message.author.send(`${tipper.name} sent you a **${amount} eZEN** tip!`);
 
-    for (let i = 0; i < tipAllChannels[idx].used_user.length; i++) {
-      if (tipAllChannels[idx].used_user[i].id === message.author.id) {
-        return message.reply("you can't `open` this for the second time...");
-      }
-    }
+  debugLog(`open message.author: ${receiver.name} ${receiver.id}`);
 
-    sendZen(tipper, receiver, amount);
-    bot.users.cache.get(tipper.id).send('<@' + message.author.id + '> received your tip (' + amount.toString() + ' ZEN)!');
-    message.author.send(`${bot.users.cache.get(tipper.id).tag} sent you a **${amount} ZEN** tip!`);
-
-    debugLog('open message.author.id ' + message.author.id);
-
-    tipAllChannels[idx].n_used += 1;
-    tipAllChannels[idx].used_user.push({
-      id: message.author.id,
-      amount: amount,
-    });
-
-    debugLog('tipAllChannels[idx].n' + tipAllChannels[idx].n);
-    debugLog('tipAllChannels[idx].n_used' + tipAllChannels[idx].n_used);
-
-    // if empty, then remove from active list of open tips
-    if (tipAllChannels[idx].n === tipAllChannels[idx].n_used) {
-      tipAllChannels.splice(idx, 1);
-
-      return message.reply('that was the last piece! ZEN Packet from <@' + tipper.id + '> is now empty, thank you!');
-    }
+  tipObj.n_used += 1;
+  tipObj.used_user.push({
+    id: message.author.id,
+    amount: amount,
   });
+
+  debugLog('tipObj.n ' + tipObj.n);
+  debugLog('tipObj.n_used ' + tipObj.n_used);
+
+  // if empty, then remove from active list of open tips
+  if (tipObj.n === tipObj.n_used) {
+    tipAllChannels.splice(idx, 1);
+
+    return message.reply(`that was the last piece! eZEN Packet from ${tipper.name}<@${tipper.id}> is now empty, thank you!`);
+  }
+  // });
 }
 
 /**
  * Try to find if channel has been already used,
  * if so, then replace last open tip in that channel.
- * @param tip
- * @param message
+ * @param {object} tip  a tip with
+      channel_id: string
+      tipper: User
+      luck: boolean
+      amount_total: number,
+      quotient: number,
+      n: number,
+      n_used: 0,
+      luck_tips: array of random tip amounts (if luck is true),
+      used_user: [],
+      creation_date: new Date(),
+ * @param {Message} message  discord message
+ * @returns 
  */
 function isChannelTipAlreadyExist(tip, message) {
   let now = new Date();
@@ -937,18 +928,18 @@ function isChannelTipAlreadyExist(tip, message) {
       if (diffMins > allowedTimeBetweenChannelTips) {
         // tip already exist, but it expire -> replace it
         tipAllChannels[i] = tip;
-        message.reply('new `' + type + '` ZEN packet has been created (' + tip.amount_total.toString() + ' ZEN)! Claim it with command `!tip open`');
+        message.reply('new `' + type + '` eZEN tip package created with total ' + tip.amount_total.toString() + ' eZEN! First ' + tip.n + ' members can claim a portion with command `!ezentip open`');
         return 0;
       } else {
         // tip already exist and is still valid
-        message.reply("can't create new ZEN packet because" + ' the previous tip is still in progress!\n**' + tipAllChannels[i].n_used + '/' + tipAllChannels[i].n + ' opened**\n**' + (20 - diffMins) + ' minutes left**');
+        message.reply("can't create new eZEN packet because" + ' the previous tip is still in progress!\n**' + tipAllChannels[i].n_used + '/' + tipAllChannels[i].n + ' opened**\n**' + (20 - diffMins) + ' minutes left**');
         return 1;
       }
     }
   }
   // tip doesnt exist in this channel -> create new
   tipAllChannels.push(tip);
-  message.reply('new `' + type + '` ZEN packet has been created (' + tip.amount_total.toString() + ' ZEN)! Claim it with command `!tip open`');
+  message.reply('new `' + type + '` eZEN tip package created with total ' + tip.amount_total.toString() + ' eZEN! First ' + tip.n + ' members can claim a portion with command `!ezentip open`');
   return 2;
 }
 
@@ -983,11 +974,13 @@ function shuffle(array) {
  */
 function createTipLuck(message, tipper, words) {
   if (message.channel.type === 1) {
-    return message.reply("you can't send me this command in a DM");
+    return message.reply("You can't send me this command in a DM");
   }
 
-  // wrong command syntax
-  if (words.length < 4 || !words) {
+  // wrong command syntax.  if here words[1] = 'each'
+  if (words.length < 4) {
+    return message.reply("Incomplete command. Check help.  DM me !ezentip help")
+  } else if (!words) {
     return doHelp(message, words);
   }
 
@@ -1006,9 +999,9 @@ function createTipLuck(message, tipper, words) {
     }
     let quotient = (amount / n).toFixed(8);
 
-    debugLog('createTipLuck amount' + amount);
-    debugLog('createTipLuck n' + n);
-    debugLog('createTipLuck quotient' + quotient);
+    debugLog('createTipLuck amount ' + amount);
+    debugLog('createTipLuck n ' + n);
+    debugLog('createTipLuck quotient ' + quotient);
 
     let luckTips = new Array(parseInt(n));
     if (n > 1) {
@@ -1019,10 +1012,10 @@ function createTipLuck(message, tipper, words) {
       let sum = luckTips.reduce(function (total, num) {
         return parseFloat(total) + parseFloat(num);
       });
-      debugLog('createTipLuck sum' + sum);
+      debugLog('createTipLuck sum ' + sum);
 
       luckTips[luckTips.length - 1] = (parseFloat(amount) - parseFloat(sum)).toFixed(8);
-      debugLog('createTipLuck luckTips' + luckTips);
+      debugLog('createTipLuck luckTips ' + luckTips);
 
       // shuffle random tips (somewhere is BONUS) :-)
       luckTips = shuffle(luckTips);
@@ -1055,11 +1048,13 @@ function createTipLuck(message, tipper, words) {
  */
 function createTipEach(message, tipper, words) {
   if (message.channel.type === 1) {
-    return message.reply("you can't send me this command in a DM");
+    return message.reply("You can't send me this command in a DM");
   }
 
-  // wrong command syntax
-  if (words.length < 4 || !words) {
+  // wrong command syntax.  if here it was routed by word[1] = 'luck'
+  if (words.length < 4) {
+    return message.reply("Incomplete command. Check help.  DM me !ezentip help")
+  } else if (!words) {
     return doHelp(message, words);
   }
 
@@ -1067,20 +1062,20 @@ function createTipEach(message, tipper, words) {
     if (err) return;
 
     if (!getValidatedMaxAmount(amount)) {
-      return message.reply('Tip 1 zen maximum !');
+      return message.reply(`Tip ${MAX_TIP} ezen maximum !`);
     }
 
     let n = parseFloat(words[3]).toFixed(8);
     if (isNaN(n) || n <= 0) {
       return message.reply("I don't know how to tip that many people!");
     } else if (n > 20) {
-      return message.reply('20 people is the maximum per ZEN packet!');
+      return message.reply('20 people is the maximum per eZEN packet!');
     }
     let quotient = (amount / n).toFixed(8);
 
-    debugLog('createTipEach n' + n);
-    debugLog('createTipEach quotient' + quotient);
-    debugLog('createTipEach amount' + amount);
+    debugLog('createTipEach n ' + n);
+    debugLog('createTipEach quotient ' + quotient);
+    debugLog('createTipEach amount ' + amount);
 
     let tipOneChannel = {
       channel_id: message.channel.id,
@@ -1113,6 +1108,44 @@ function resolveMention(usertxt) {
   return userid;
 }
 
+function isNumber(value) {
+  return !isNaN(parseFloat(value)) && isFinite(value);
+}
+
+/**
+ * 
+ * @param {string} ident  id or username 
+ * @param {bot} bot 
+ * @returns guild member if found
+ */
+async function getDiscordUser(identity, bot) {
+  let ident = identity.startsWith("@") ? identity.substring(1) : identity;
+  let user = bot.users.cache.get(ident);
+  if (!user && isNumber(ident)) {
+    // try fetching
+    const member = await bot.guilds.cache.get(botcfg.serverId).members.fetch(ident);
+    user = member.user;
+  }
+  if (!user) {
+    // try by name.  User may not have selected the recipient user and just entered text
+    debugLog(`getDiscordUser finding recipient by name ${ident}`);
+    user = bot.users.cache.find(u => u.globalName === ident);
+    if (!user) {
+      // 
+      const guild = await bot.guilds.fetch(botcfg.serverId);
+      const members = await guild.members.search({ query: ident });
+
+      // ensure search found globalName and not some other value matched
+      if (members.size >= 1) {
+        for (const value of members) { if (value[1].user.globalName === ident) user = value[1].user }
+      }
+      if (user) debugLog(`Found user ${ident} id = ${user.id}`)
+    }
+  }
+
+  return Promise.resolve(user);
+}
+
 /**
  * @param message
  * @param tipper
@@ -1121,7 +1154,7 @@ function resolveMention(usertxt) {
  */
 function doTip(message, tipper, words, bot) {
   if (message.channel.type === 1) {
-    return message.reply("you can't send me this command in a DM");
+    return message.reply("You can't send me this command in a DM");
   }
 
   // wrong command syntax
@@ -1129,39 +1162,43 @@ function doTip(message, tipper, words, bot) {
     return doHelp(message, words);
   }
 
-  getValidatedAmount(tipper, message, words[2], function (err, amount) {
+  getValidatedAmount(tipper, message, words[2], async function (err, amount) {
     if (err) return;
 
-    debugLog(amount);
-
     if (!getValidatedMaxAmount(amount)) {
-      return message.reply('Tip 1 zen maximum !');
+      return message.reply(`Tip ${MAX_TIP} ezen maximum !`);
     }
 
     let targetId = resolveMention(words[1]);
-    debugLog('doTip targetId' + targetId);
+    debugLog('doTip targetId resolved: ' + targetId);
     try {
-      const target = bot.users.cache.get(targetId);
-      debugLog('doTip target.id ' + target.id);
+      const target = await getDiscordUser(targetId, bot);
+      debugLog('doTip target recipient: ' + (target ? target.id : 'not found'));
 
       if (!target) {
         return message.reply("I cant't find a user in your tip ...");
       } else {
         if (tipper.id === target.id) {
-          return message.reply("you can't tip yourself ...");
+          return message.reply("You can't tip yourself ...");
         }
+        const { err, user } = await getUser(target.id, bot, false)
+        if (err) {
+          return message.reply(err.message || err);
+        }
+        let username = target.globalName || user.name;
+        if (!username) username = await getName(target.id, bot, target);
 
-        getUser(target.id, function (err, receiver) {
-          if (err) {
-            return message.reply(err.message);
-          }
-
-          sendZen(tipper, receiver, amount);
-          message.author.send(`${bot.users.cache.get(receiver.id).tag} received your tip (${amount} ZEN)!`);
-          const msgtotarget = words.length > 3 ? words.slice(3).join(' ') : '';
-          const text = `${bot.users.cache.get(tipper.id).tag} sent you a **${amount} ZEN** tip! ${msgtotarget}`;
-          target.send(text);
-        });
+        const sendError = await sendZen(tipper, user, amount)
+        if (sendError) {
+          debugLog(sendError);
+          return message.reply(sendError)
+        }
+        message.author.send(`${username} received your tip (${amount} eZEN)!`);
+        const msgtotarget = words.length > 3 ? words.slice(3).join(' ') : '';
+        const text = `${tipper.name} sent you a **${amount} eZEN** tip! ${msgtotarget}`;
+        target.send(text);
+        // });
+        ;
       }
     } catch (error) {
       debugLog('Failed to fetch user or process tip: ', error);
@@ -1171,11 +1208,11 @@ function doTip(message, tipper, words, bot) {
 
 function doPayout(message, tipper, words, bot) {
   if (message.channel.type === 1) {
-    return message.reply("you can't send me this command in a DM");
+    return message.reply("You can't send me this command in a DM");
   }
 
   if (!tipper.isAdmin) {
-    return message.reply('That is an invalid command. Check !tip help');
+    return message.reply('That is an invalid command. Check !ezentip help');
   }
 
   // wrong command syntax
@@ -1183,41 +1220,46 @@ function doPayout(message, tipper, words, bot) {
     return doHelp(message, words);
   }
 
-  getValidatedPayoutAmount(tipper, message, words[3], function (err, amount) {
-    if (err) return;
-
-    debugLog(amount);
+  getValidatedPayoutAmount(tipper, message, words[3], async function (error, amount) {
+    if (error) return;
 
     if (!getValidatedMaxAmount(amount)) {
-      return message.reply('Payout 1 zen maximum !');
+      return message.reply(`Payout ${MAX_TIP} ezen maximum !`);
     }
 
     let targetId = resolveMention(words[2]);
     debugLog('doPayout targetId  ' + targetId);
 
     try {
-      const target = bot.users.cache.get(targetId);
+      const target = await getDiscordUser(targetId, bot);
       debugLog('doPayout target.id ' + target.id);
 
       if (!target) {
         return message.reply("I cant't find a user in your payout ...");
       } else {
         if (tipper.id === target.id) {
-          return message.reply("you can't pay yourself ...");
+          return message.reply("You can't pay yourself ...");
         }
 
-        getUser(target.id, function (err, receiver) {
-          if (err) {
-            return message.reply(err.message);
-          }
+        const { err, user } = await getUser(target.id, bot, false)
+        if (err) {
+          return message.reply(err.message || err);
+        }
+        let username = user.globalName;
+        if (!username) username = await getName(target.id, bot, target)
 
-          sendZen(tipper, receiver, amount);
-          message.author.send(`${bot.users.cache.get(receiver.id).tag} received your tip (${amount} ZEN)!`);
-          const msgtotarget = words.length > 4 ? words.slice(4).join(' ') : '';
-          const text = `${bot.users.cache.get(tipper.id).tag} sent you a **${amount} ZEN** tip! ${msgtotarget}`;
-          target.send(text);
-          if (moderation.logchannel) sendToBotLogChannel(bot, `payout of ${amount} sent to <@${receiver.id}> ${msgtotarget}`);
-        });
+        const sendError = await sendZen(tipper, user, amount)
+        if (sendError) {
+          debugLog(sendError);
+          return message.reply(sendError)
+        }
+        message.author.send(`${username} received your tip (${amount} eZEN)!`);
+        const msgtotarget = words.length > 4 ? words.slice(4).join(' ') : '';
+        const text = `${tipper.name} sent you a **${amount} ZEN** tip! ${msgtotarget}`;
+        target.send(text);
+        if (moderation.logchannel) sendToBotLogChannel(bot, `payout of ${amount} sent to <@${user.id}> ${msgtotarget}`);
+        // });
+
       }
     } catch (error) {
       debugLog('Failed to fetch user or process tip: ', error);
@@ -1225,36 +1267,154 @@ function doPayout(message, tipper, words, bot) {
   });
 }
 
-/**
- * @param tipper
- * @param receiver
- * @param amount
- */
-function sendZen(tipper, receiver, amount) {
-  // update tipper's spent amount
-  User.updateOne({ id: tipper.id }, { $inc: { spent: amount } }, function (err, raw) {
-    if (err) {
-      debugLog(err);
-    } else {
-      debugLog(raw);
+async function doMultiPayout(message, tipper, words, bot) {
+  if (message.channel.type === 1) {
+    return message.reply("You can't send me this command in a DM");
+  }
+
+  if (!tipper.isAdmin) {
+    return message.reply('That is an invalid command. Check !ezentip help');
+  }
+
+  // wrong command syntax
+  if (words.length < 3 || !words) {
+    return doHelp(message, words);
+  }
+
+  const recipients = [];
+  let user;
+  let unfound = '';
+  let idx = 0;
+  let tipMessage;
+  for (const word of words) {
+    if (idx > 2) {
+      if (word.startsWith("<@")) {
+        const id = resolveMention(word);
+        user = await getDiscordUser(id, bot);
+        if (!user) {
+          unfound += ` ${word}\n`
+        } else {
+          recipients.push(user);
+        }
+      } else if (word.startsWith("@")) {
+        user = await getDiscordUser(word, bot);
+        if (!user) {
+          unfound += ` ${word}\n`
+        } else {
+          recipients.push(user);
+        }
+
+      } else {
+        break;
+      }
+    }
+    idx = idx + 1;
+  }
+
+  if (unfound) return message.reply(`Unable to find the following users\n ${unfound}`);
+  if (recipients.length === 0) return message.reply('Unable to find any recipients');
+
+  if (idx < words.length) tipMessage = words.slice(idx).join(" ");
+  // debugLog(recipients);
+
+  getValidatedPayoutAmount(tipper, message, words[2], async function (err, amount) {
+    if (err) return;
+
+    // command order is '!ezenttip command amount idlist message'
+    //  breakdown list of users and validate
+    const ids = words[3].replace(":", ",").split(',');
+    if (ids.length === 0) return message.reply("No list of user ids found");
+
+    const hasTipper = ids.filter((id) => id === tipper.id)
+    if (hasTipper.length > 0) {
+      return message.reply(`You can't pay yourself. Please remove id ${hasTipper[0]}`);
+    }
+
+    // check tipper balance
+    const total = words[2] * ids.length;
+    const balInfo = await getBalance(tipper, bot);
+    if (total > balInfo.balance) return message.reply(`Insufficient funds. ${(balInfo.balance - total).toFixed(8)} needed.`)
+
+
+    // payout to each
+    try {
+
+      for (const member of recipients) {
+
+        const { err, user } = await getUser(member.id, bot, false)
+        if (err) {
+          return message.reply(err.message || err);
+        }
+        // if (!user.name) user.name = await getName(member.id, bot, member)
+        let username = member.globalName || user.name;
+        if (!username) username = await getName(member.id, bot);
+
+        const sendError = await sendZen(tipper, user, amount, bot)
+        if (sendError) {
+          debugLog(sendError);
+          return message.reply(sendError)
+        }
+        message.author.send(`${username} received your tip (${amount} eZEN)!`);
+        // const msgtotarget = words.length > 4 ? words.slice(4).join(' ') : '';
+        const text = `${tipper.name} sent you a **${amount} ZEN** tip! ${tipMessage || ''}`;
+        member.send(text).catch((error) => {
+          message.author.send(`Unable to send message to ${username}. DM may be blocked. ${error.message}.`);
+        })
+        if (moderation.logchannel) sendToBotLogChannel(bot, `payout of ${amount} sent to <@${user.id}> ${tipMessage || ''}`);
+      }
+
+    } catch (error) {
+      debugLog('Failed to fetch user or process tip: ', error);
     }
   });
+}
+
+
+/**
+ * 
+ * @param {User} tipper 
+ * @param {User} receiver 
+ * @param {int} amount  ezen to tip
+ * @param {bot} bot  optional 
+ * @returns Promise with error message if present
+ */
+// async function sendZen(tipper, receiver, amount, cb) {
+async function sendZen(tipperUser, receiver, amount, bot) {
+  let user;
+  // if bot is passed it means this is in a loop and the tipper balance
+  // must be retrieved from the database each time since it is being updated
+  // multiple times.
+  if (bot) ({ user } = await getUser(tipperUser.id, bot, true));
+  const tipper = user || tipperUser;
+  const wei = toBigInt((amount * 1e18).toString())
+  // update tipper's spent amount
+  const sent = (toBigInt(tipper.spent) + wei).toString()
+  let resp = await User.updateOne({ id: tipper.id }, { spent: sent }).exec();
+  if (resp.modifiedCount != 1) {
+    const msg = `Sending failed. Unable to update sent amount for ${tipper.name}`
+    // return cb("error", msg)
+    return Promise.resolve(msg)
+  }
+  debugLog(`SendZen: added ${amount} to spent for user ${tipper.id}`);
 
   // and receiver's received amount
-  User.updateOne({ id: receiver.id }, { $inc: { received: amount } }, function (err, raw) {
-    if (err) {
-      debugLog(err);
-    } else {
-      debugLog(raw);
-    }
-  });
+  const rcvd = (toBigInt(receiver.received) + toBigInt(wei)).toString()
+  resp = await User.updateOne({ id: receiver.id }, { received: rcvd }).exec();
+  if (resp.modifiedCount != 1) {
+    const msg = `Sending failed. Unable to update received amount for ${receiver.name}`
+    // revert the tipper Update.
+    resp = await User.updateOne({ id: tipper.id }, { spent: tipper.spent }).exec();
+    return Promise.resolve(msg)
+  }
+  debugLog(`SendZen: added ${amount} to received for user ${receiver.id}`);
+  return Promise.resolve('')
 }
 
 /**
  * @param txId is transaction id
  */
 function txLink(txId) {
-  return `<${INSIGHT_BASE}/tx/${txId}> `;
+  return `<${EON_EXPLORER}tx/${txId}> `;
 }
 
 /**
@@ -1262,7 +1422,12 @@ function txLink(txId) {
  */
 function debugLog(log) {
   if (botcfg.debug) {
-    console.log(log);
+    let ts = '';
+    if (includetimestamp) {
+      const dt = (new Date()).toISOString().slice(0, 19).replace("T", " ");
+      ts = `${dt}--`;
+    }
+    console.log(`${ts}${log}`);
   }
 }
 
@@ -1277,7 +1442,7 @@ function sendToBotLogChannel(bot, msgtext) {
 
 function suspend(msg, tipper, words, bot) {
   if (!tipper.isAdmin) {
-    return msg.reply('That is an invalid command. Check with !tip help');
+    return msg.reply('That is an invalid command. Check with !ezentip help');
   }
   lastSuspend = new Date();
 
@@ -1292,14 +1457,15 @@ function suspend(msg, tipper, words, bot) {
 
 function sweepFunds() {
   if (lastSuspend.getTime() + sweepSuspend - 500 > 0) {
-    console.log('sweeping funds');
+    debugLog('sweeping funds');
     moveFunds();
+    cleanupPending();
   }
   setTimeout(sweepFunds, sweepInterval);
 }
 
 getsSupportedCurrencies((err, resp) => {
-  if (err) return console.log(`getSupportedCurrencies: ${err} `);
-  console.log(resp);
+  if (err) return debugLog(`getSupportedCurrencies: ${err} `);
+  debugLog(resp);
 });
 sweepFunds();

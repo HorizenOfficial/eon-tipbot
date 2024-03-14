@@ -1,6 +1,6 @@
-FROM node:gallium-alpine
+FROM node:iron-alpine
 
-MAINTAINER cronic@zensystem.io
+LABEL org.opencontainers.image.authors="cronic@zensystem.io"
 
 RUN apk add --no-cache git python3 build-base bash tini
 
