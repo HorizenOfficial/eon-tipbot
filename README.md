@@ -1,16 +1,35 @@
-# Bot for ZEN's Discord
-This bot allows users to send tips (ZEN) to other users after funding their tip account. 
+# EON Zen Tip Bot for Horizen's Discord
+This bot allows users to send tips (ZEN on EON) to other users after funding their tip account.
+
+General process:    
+ - Discord member requests a deposit address from the tip bot
+ - Member sends EON ZEN (eZEN) to the deposit address using Sphere or another method
+ - Member may tip another member using the tip bot. Help is available by DMing the bot with: !ezentip help
+ - When a member receives a tip, entries are created in the bot's database to track sender and receiver balances.
+ - The recipient may tip another member with the tip they received or add more funds.
+ - A member may withdraw funds in their tip account at any time.
+
+Note: all funds are stored in the bot's EON address.
 
 Features:
 
-- Tipbot for ZEN. Responds to `!tip`.
+- Tip bot for eZEN. Responds to `!ezentip`.
 - Dynamic plugin loading with permission support.
+- Send a tip to one other member with optional message
+- Send a tip of random amount to one member with optional message
+- Send a tip based on fiat currency or other cryptcurrency amount with optional message
+- Multiple user support
+  - Send either a set amount or a random amount to a channel for the first 20 members who respond
+- Admin commands
+  - Suspend scheduled background tasks. Usefull when using the payouts command
+  - Send a payout to a member bypassing balance checks (runs more quickly)
+  - Check balance total of all users and the bot.
 
 
 ## Requirements
 
-- node > 16.9.0
-- mongod > 3.6.0
+- node > 18.19.0
+- mongod > 5.0.2
 
 
 ## Installation
@@ -19,7 +38,15 @@ Create a bot and get the bot's API Token: https://discordapp.com/developers/appl
 
 Connect the bot to a discord server.
 
-Edit and rename default.json.example in /config,
+Edit, update and rename example.default.js in /config to default.js
+  - enter the bot token and the server id.
+  - change the 'debug' and 'testnet' to false for production. 'debug' can be left true if logging is needed.
+  - enter the EON address and private key of the bot.
+  - update default max tip (number) and gas price (string) if needed. Note: gas and gas price is fixed so transfers and withdrawls include all funds.
+  - change the mongodb settings. No options are needed for the listed versions dependencies. The database is created when started.
+  - enter the moderation role and logchannel id.
+  - enter a list of admin ids.    
+
 Make sure you have mongod running,
 then run:
 ```
@@ -27,7 +54,8 @@ npm install
 node bot/bot.js
 ```
 
-or for production:
+or for production:    
+set the environment variable NODE_ENV=production
 ```
 npm run prod
 ```
@@ -38,19 +66,11 @@ npm run prod
 Based on the original work https://github.com/lbryio/lbry-tipbot from filipnyquist <filip@lbry.io>
 
 ## Changes
-2022-09:
- - Updated discord.js to v14 (required some code changes)
- - Updated other dependencies
-2021-09: 
-- The method to check all users for new deposits each time any user makes any call to tipbot has been changed to run every 20 minutes (configurable).  The check also runs when a user checks their balance, but only for that user.
- - A user may be designated an admin by adding their discord id to the configuration.  The admin has two extra !tip commands: suspend and payout.
- - The admin may suspend the periodic check new deposits task so it does not run for a specified number of minutes and interrupt processing payouts.
- - The payout command allows an admin process payments without checking the balance for the admin which was slowing down processing.
- - Help was updated with the following:
-   - help with admin commands for admins only
-   - dynamic list of currencies supported. List is updated when tipbot restarts.
- - Node modules were updated to more recent versions along with rewrites where needed due to changes in some modules.
- - Fixed the alternate currency feature. It now uses coingecko and supports more currencies.
- - Fixed sending a optional message with a tip.
- - Fixed testing on testnet.
+### 2024-03:
+ - New instance (rewrite and repo) of the tipbot for Zen on the EON sidechain. This version does not support Zen on the horizen mainchain.
+ - Added support for a username or tag as text in addition to a user object in some tip commands.
+ - Added a checkbals admin command that returns the total balance of all accounts and the current balance of the bot account.
+ - Skip responding to @everyone and @here mentions.
+ - Updated dependencies    
+
 
