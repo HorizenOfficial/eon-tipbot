@@ -1,9 +1,9 @@
 {
   "dependencies": {
-    "axios": "^1.6.7",
-    "discord.js": "^14.14.1",
-    "ethers": "^6.11.1",
-    "mongoose": "^8.2.1"
+    "axios": "^1.7.2",
+    "discord.js": "^14.15.3",
+    "ethers": "^6.13.1",
+    "mongoose": "^8.4.4"
   },
   "scripts": {
     "prettier": "prettier * --write",
@@ -15,7 +15,7 @@
     "eslint": "^8.57.0",
     "eslint-config-prettier": "^9.1.0",
     "eslint-plugin-node": "^11.1.0",
-    "prettier": "^3.2.5"
+    "prettier": "^3.3.2"
   },
   "name": "eonzen-tipbot",
   "version": "0.0.1",
@@ -29,6 +29,8 @@
   "original-author": "filipnyquist <filip@lbry.io>",
   "repository": "https://github.com/HorizenOfficial/eon-tipbot",
   "author": "allan@zensystem.io",
-  "contributors": ["Robin Guyard <Gniar@protonmail.com>"],
+  "contributors": [
+    "Robin Guyard <Gniar@protonmail.com>"
+  ],
   "license": "MIT"
 }
