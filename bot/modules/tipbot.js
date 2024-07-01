@@ -1,7 +1,7 @@
 'use strict';
 
-// eslint-disable-next-line node/no-unpublished-require
-const { Config } = require('../../config/default');
+const cfgPath = process.env.EONBOT_CFGPATH || '../../config/default.js'
+const { Config } = require('' + cfgPath);
 const mongoose = require('mongoose');
 const axios = require('axios');
 const { ethers, toBigInt } = require('ethers');
@@ -30,14 +30,12 @@ try {
 }
 
 // Set up API
-const EON_EXPLORER = botcfg.testnet ? `${ezencfg.testExplorerURL}` : `${ezencfg.mainExplorerURLExplorerURL}`;
-const EON_API = `${EON_EXPLORER}api`;
+const EON_EXPLORER = botcfg.testnet ? ezencfg.testExplorerURL : ezencfg.mainExplorerURL;
+const EON_API = botcfg.testnet ? ezencfg.testAPIExpURL : ezencfg.mainAPIExpURL;
 const axiosApi = axios.create({
   baseURL: EON_API,
   timeout: 10000,
 });
-const BALPARAMS = { module: 'account', action: 'balance', address: '' };
-// const BLOCKNUMPARAMS = { module: 'block', action: 'eth_block_number' };
 
 const GAS_LIMIT = 21000n; // sending to another account will always be 21000 gas
 const GAS_PRICE = ezencfg.gasPrice ? toBigInt(ezencfg.gasPrice) : 20000000000n; // must be at least the base which is the default here.
@@ -45,19 +43,25 @@ const TX_COST = (GAS_LIMIT * GAS_PRICE);
 const MAX_TIP = ezencfg.maxTip || 1;
 
 // Set up mongodb
-const dbname = ezencfg.testnet ? mongodb.urlTest : mongodb.url;
+const dbConnection = botcfg.testnet ? mongodb.urlTest : mongodb.url;
+debugLog(dbConnection)
 let db;
-try {
-  mongoose.connect(dbname, mongodb.options);
-  db = mongoose.connection;
-  db.on('error', console.error.bind(console, 'connection error: '));
-  db.once('open', function () {
-    console.log("Mongodb: connected to '" + this.host + '/' + this.name + "'!");
-  });
-} catch (error) {
-  console.error(error);
-  process.exitCode = 1;
+let User;
+async function initMongo() {
+  try {
+    await mongoose.connect(dbConnection);
+    db = mongoose.connection;
+    db.on('error', console.error.bind(console, 'connection error: '));
+    db.once('open', function () {
+      console.log("Mongodb: connected to '" + this.host + '/' + this.name + "'!");
+    });
+    User = db.model('User', userSchema);
+  } catch (error) {
+    console.error(error);
+    process.exitCode = 1;
+  }
 }
+
 
 const userSchema = mongoose.Schema({
   id: String,
@@ -68,7 +72,6 @@ const userSchema = mongoose.Schema({
   spent: String,
   received: String,
 });
-const User = db.model('User', userSchema);
 
 // object to track transfers in and out of bot account in case there are
 // multiple requests within one block.
@@ -267,7 +270,7 @@ function doHelp(message, tipper, words) {
       '**!ezentip payout <@user> <amount><fiat_currency_ticker> [message]** : send a tip to a someone who has completed a task. ' +
       'Be sure your balance is sufficient for the total of all payouts to be made since ' +
       'your balance check is skipped when using this command. Supports the same arguments as !ezentip @<user>.\n\n' +
-      '**!ezentip multipay <amounttoeach> @name1 @name2 @name3 @morenames [message]** : send the tip amount to each user listed by their @name.' +
+      '**!ezentip multipay <amounttoeach> @name1 @name2 @name3 @morenames [message]** : send the tip amount to each user listed by their @name. ' +
       'The tipper\'s balance and each name is checked before sending. Any text after last @name is sent as a message to each user. \n\n' +
       '**!ezentip checkbals [list]** returns the total net balance of all the user accounts and the balance of the bot. Include "list" ' +
       'for individual user balances.'
@@ -292,9 +295,14 @@ function doHelp(message, tipper, words) {
  * @returns the displayed username
  */
 async function getName(id, bot, discordUser) {
-  const member = discordUser || await bot.guilds.cache.get(botcfg.serverId).members.fetch(id);
-  // const user = await bot.guild.members.fetch(id);
-  return Promise.resolve(member.globalName || member.tag || member.user.globalName || member.user.tag);
+  try {
+    const member = discordUser || await bot.guilds.cache.get(botcfg.serverId).members.fetch(id);
+    return Promise.resolve(member.globalName || member.tag || member.user.globalName || member.user.tag);
+  } catch (error) {
+    const errMsg = `ERROR id ${id}: ${error.message || error}`
+    debugLog(errMsg)
+    return Promise.resolve(errMsg)
+  }
 }
 
 /**
@@ -321,7 +329,11 @@ async function getUser(id, bot, doName) {
 
   if (userDb) {
     // Existing User
-    if (doName) userDb.name = await getName(id, bot);
+    if (doName) {
+      const name = await getName(id, bot);
+      // the error is likely "Unknown Member" if not found in the guild.
+      userDb.name = name.includes('ERROR') ? name.substring(name.indexOf(':') + 2) : name;
+    }
     return Promise.resolve({ err: null, user: userDb });
   } else {
     // New User account
@@ -420,11 +432,13 @@ function getFiatToZenEquivalent(amount, fiatCurrencySymbol, zentofiat, cb) {
     .get(API_URL)
     .then((res) => {
       const zenPrice = parseFloat(res.data.prices[0][1]);
-      if (zentofiat) return cb(null, (zenPrice * amount).toFixed(8).toString());
+      if (zentofiat) return cb(null, (zenPrice * amount).toFixed(2).toString());
       return cb(null, (amount / zenPrice).toFixed(8).toString());
     })
     .catch((err) => {
-      return cb(err.data ? err.data : err, null);
+      const errMsg = err?.response?.data?.error || err
+      debugLog(errMsg)
+      return cb(errMsg || err, null);
     });
 }
 
@@ -439,7 +453,9 @@ function getsSupportedCurrencies(cb) {
       return cb(null, 'Currency list updated');
     })
     .catch((err) => {
-      return cb(err.data ? err.data : err, null);
+      const errMsg = err?.response?.data?.error || err
+      debugLog(errMsg)
+      return cb(errMsg || err, null);
     });
 }
 
@@ -634,7 +650,6 @@ async function cleanupPending() {
  */
 async function transferToBot(user, ezenbal) {
   try {
-    // if (!user.name) user.name = await getName(user.id);
     const signer = new ethers.Wallet(user.priv, connection);
     const value = ezenbal - TX_COST; // value in wei as a bigInt
     const tx = {
@@ -675,18 +690,18 @@ async function transferToBot(user, ezenbal) {
  * @param {User} user 
  */
 function checkFunds(user) {
-  const params = { ...BALPARAMS }
-  params.address = user.address;
+  debugLog('Checking funds for ' + user.address)
+  const url = `addresses/${user.address}/coin-balance-history`
   axiosApi
-    .request({ url: '', params })
+    .request({ url })
     .then((res) => {
-      const bal = toBigInt(res.data.result)
+      const bal = toBigInt(res.data.items[0].value)
       if (bal > 2n * TX_COST) {
         transferToBot(user, bal);
       }
     })
     .catch((err) => {
-      return debugLog(err.data ? err.data : err);
+      return debugLog(`Check funds for ${user.address}. ${err?.response?.data?.message || err}`);
     });
 }
 
@@ -722,6 +737,7 @@ async function checkBalances(message, tipper, words, bot) {
       const balInfo = await getBalance(user)
       userTotalZen += balInfo.balance || 0
       if (doList) {
+        // if user is not found, error message is passed to alert admin
         const name = await getName(user.id, bot);
         balList += `${name}: ${balInfo.balance}\n`
       }
@@ -1186,7 +1202,11 @@ function doTip(message, tipper, words, bot) {
           return message.reply(err.message || err);
         }
         let username = target.globalName || user.name;
-        if (!username) username = await getName(target.id, bot, target);
+        if (!username) {
+          const name = await getName(target.id, bot, target);
+          // "Unknown Member" if not found in the guild.
+          username = name.includes('ERROR') ? name.substring(name.indexOf(':') + 2) : name;
+        }
 
         const sendError = await sendZen(tipper, user, amount)
         if (sendError) {
@@ -1246,7 +1266,12 @@ function doPayout(message, tipper, words, bot) {
           return message.reply(err.message || err);
         }
         let username = user.globalName;
-        if (!username) username = await getName(target.id, bot, target)
+        if (!username) {
+          const name = await getName(target.id, bot, target);
+          // "Unknown Member" if not found in the guild.
+          username = name.includes('ERROR') ? name.substring(name.indexOf(':') + 2) : name;
+        }
+
 
         const sendError = await sendZen(tipper, user, amount)
         if (sendError) {
@@ -1345,9 +1370,11 @@ async function doMultiPayout(message, tipper, words, bot) {
         if (err) {
           return message.reply(err.message || err);
         }
-        // if (!user.name) user.name = await getName(member.id, bot, member)
         let username = member.globalName || user.name;
-        if (!username) username = await getName(member.id, bot);
+        if (!username) {
+          const name = await getName(member.id, bot);
+          username = name.includes('ERROR') ? name.substring(name.indexOf(':') + 2) : name;
+        }
 
         const sendError = await sendZen(tipper, user, amount, bot)
         if (sendError) {
@@ -1468,4 +1495,6 @@ getsSupportedCurrencies((err, resp) => {
   if (err) return debugLog(`getSupportedCurrencies: ${err} `);
   debugLog(resp);
 });
-sweepFunds();
+initMongo().then(() =>
+  sweepFunds()
+)

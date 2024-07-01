@@ -1,7 +1,7 @@
 'use strict';
 
-// eslint-disable-next-line node/no-unpublished-require
-const { Config } = require('../config/default.js');
+const cfgPath = process.env.EONBOT_CFGPATH || '../config/default.js'
+const { Config } = require('' + cfgPath);
 const { Client, GatewayIntentBits, Partials } = require('discord.js');
 
 
