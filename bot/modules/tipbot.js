@@ -874,6 +874,7 @@ async function doOpenTip(message, receiver, words, bot) {
   }
 
   debugLog('open receiver.id ' + receiver.id);
+  debugLog('open receiver.id ' + receiver.id);
 
   const claimed = tipObj.used_user.find(user => user.id = message.author.id);
   if (claimed) return message.reply("You can't `open` this for the second time...");
