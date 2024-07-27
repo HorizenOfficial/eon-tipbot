@@ -18,6 +18,7 @@ ezencfg
 
 mongodb
   url - should be a unique database.  include '?authSource=admin' or whatever the authentication database is auth enabled
+  urlTest - use a different database name if testnet is true in botcfg
   options - configuration to override mongodb if needed.
 
 moderation
@@ -55,6 +56,7 @@ exports.Config = {
     "gasPrice": "10000000000"
   },
   "mongodb": {
+    "urlTest":"mongodb://mongodb-tipbot:27017/ezentipbotTest?authSource=admin",
     "url":"mongodb://localhost:27017/ezentipbot?authSource=admin",
     "options": {
     }
