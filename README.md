@@ -22,8 +22,8 @@ Features:
   - Send either a set amount or a random amount to a channel for the first 20 members who respond
 - Admin commands
   - Suspend scheduled background tasks. Usefull when using the payouts command
-  - Send a payout to a member bypassing balance checks (runs more quickly)
-  - Check balance total of all users and the bot.
+  - Send one or more payouts to a member bypassing balance checks (runs more quickly)
+  - Check balance total of all users and the bot. Optional list all user balances.
 
 
 ## Requirements
@@ -38,7 +38,8 @@ Create a bot and get the bot's API Token: https://discordapp.com/developers/appl
 
 Connect the bot to a discord server.
 
-Edit, update and rename example.default.js in /config to default.js
+Make a copy of example.default.js and name it default.js
+  - EONBOT_CFGPATH environment variable may be used to specify the full file and path. Default is the config folder.
   - enter the bot token and the server id.
   - change the 'debug' and 'testnet' to false for production. 'debug' can be left true if logging is needed.
   - enter the EON address and private key of the bot.
@@ -66,11 +67,45 @@ npm run prod
 Based on the original work https://github.com/lbryio/lbry-tipbot from filipnyquist <filip@lbry.io>
 
 ## Changes
+### 2024-06
+  - Update URLs for api servers.
+  - Added optional env config file path.
+  - Updated init sequence to ensure db connection before sweeping funds.
+  - Updates to some logging to include more specific error causes
+  - Added return of unknown member account for admin rather than failing bot command
 ### 2024-03:
  - New instance (rewrite and repo) of the tipbot for Zen on the EON sidechain. This version does not support Zen on the horizen mainchain.
  - Added support for a username or tag as text in addition to a user object in some tip commands.
  - Added a checkbals admin command that returns the total balance of all accounts and the current balance of the bot account.
  - Skip responding to @everyone and @here mentions.
  - Updated dependencies    
+
+&nbsp;
+&nbsp;
+&nbsp;
+&nbsp;
+## Sample Docker-compose file
+version: "3"
+
+services:    
+&nbsp;&nbsp;&nbsp;&nbsp;eonzentipbot:    
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;restart: always    
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;image: eontipbot:latest    
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;container_name: ezenbot    
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;stop_grace_period: 1m    
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;volumes:    
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- "/mnt/tipbot/eonbotconfig/:/config/"    
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;environment:    
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- "EONBOT_CFGPATH=/config/default.js"    
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;network_mode: "host"    
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tmpfs:    
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- /run    
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- /tmp    
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;logging:    
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;driver: "json-file"    
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;options:    
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;max-size: "512m"    
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;max-file: "4"    
+
 
 
